@@ -4,29 +4,10 @@ A small hybrid (vector + full-text) search engine, built on a from-scratch
 LSM storage engine, in dependency-free Rust.
 
 ```
-cargo run --bin tpuffy              # demo: index 4 docs, run a hybrid query
-cargo test                          # unit + integration tests
-cargo run --release --bin tpuffy-bench   # perf sanity numbers
+cargo run --bin tpuffy                    # demo: index 4 docs, run a hybrid query
+cargo test                                # unit + integration tests
+cargo run --release --bin tpuffy-bench    # perf sanity numbers
 ```
-
-## Why this exists
-
-I wrote this against turbopuffer's database-engineer posting, which asks for
-depth in storage engines (LSMs/WALs/MVCC/compaction), search internals
-(inverted indexes/ANN/rerankers), and systems-level performance work
-(memory layout, cache lines, SIMD, profiling). Rather than describe that
-experience, this repo is that experience, scoped down to something
-readable in one sitting:
-
-| job posting asks for | where it is here |
-|---|---|
-| storage engines: LSMs, WALs, MVCC, compaction, GC | `src/wal.rs`, `src/memtable.rs`, `src/sstable.rs`, `src/compaction.rs`, `src/lsm.rs` |
-| search internals: inverted indexes, rerankers | `src/text.rs` (BM25), `src/fusion.rs` (RRF reranking) |
-| "you think in memory layouts, cache lines" | `src/vector.rs`: struct-of-arrays layout + 8-wide accumulator kernels, explained inline |
-| performance hacking: profiling, SIMD, IO tuning | `docs/PERF.md` — concrete `perf`/`bpftrace`/`strace`/`valgrind` commands against this repo |
-| "methodically work through problems until root cause" | `docs/ARCHITECTURE.md`'s non-goals section — what's *not* here and why, instead of hand-waving |
-| "write crisp docs" | this README, `docs/ARCHITECTURE.md`, and inline module docs try to be that |
-| "human — admit what you don't know" | non-goals section is explicit that there's no ANN index, no leveled compaction, no distributed anything, no concurrency — see below |
 
 ## What it does
 
@@ -41,21 +22,67 @@ for hit in hits {
 }
 ```
 
-Under the hood: `upsert` writes the vector into a flat brute-force index,
-the text into a BM25 inverted index, and the blob durably into an LSM
-key-value store (WAL-backed, MVCC-versioned, background-compacted). `query`
-runs both sub-indexes, fuses the ranked lists with Reciprocal Rank Fusion,
-and hydrates the top-k with their blobs from the LSM store.
+`upsert` writes the vector into a flat brute-force index, the text into a
+BM25 inverted index, and the vector/text/blob together into an LSM
+key-value store (WAL-backed, MVCC-versioned, background-compacted).
+`query` runs both sub-indexes, fuses the ranked lists with Reciprocal Rank
+Fusion, and hydrates the top-k with their blobs from the LSM store. Both
+indexes are rebuilt from the LSM store on open, so a restart doesn't lose
+anything that was durably written.
 
-## What's deliberately not here
+## Architecture
 
-This is scoped as a readable systems-primitives demo, not a production
-database. No ANN index (search is exact brute-force), no leveled
-compaction (one tier, fully re-merged), no replication/distributed
-anything, no block compression, no concurrency. Each of these is called out
-in `docs/ARCHITECTURE.md` along with what building the real version would
-involve — the point of naming them explicitly is that pretending they're
-out of scope by omission would be a worse signal than naming them.
+```
+                    ┌─────────────────────┐
+                    │       Engine         │  upsert / delete / query
+                    └──────────┬───────────┘
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+      ┌───────────────┐ ┌──────────────┐ ┌──────────────┐
+      │ VectorIndex    │ │ InvertedIndex│ │  LsmEngine    │
+      │ (flat, SoA)    │ │ (BM25)       │ │  (documents)  │
+      └───────────────┘ └──────────────┘ └──────┬────────┘
+                                                  │
+                          ┌───────────────────────┼───────────────────────┐
+                          ▼                        ▼                       ▼
+                    ┌──────────┐            ┌──────────────┐       ┌─────────────┐
+                    │   WAL     │            │  MemTable     │       │  SSTable(s)  │
+                    │ (durability)│          │ (sorted MVCC) │       │ (immutable)  │
+                    └──────────┘            └──────────────┘       └──────┬───────┘
+                                                                            │
+                                                                     ┌──────▼──────┐
+                                                                     │ Compaction   │
+                                                                     │ (k-way merge)│
+                                                                     └─────────────┘
+```
+
+* **WAL** (`src/wal.rs`) — length-prefixed records with an FNV-1a checksum.
+  Replay stops at the first bad checksum or short read instead of erroring,
+  since a torn tail record is the expected shape of a crash mid-write.
+* **MemTable** (`src/memtable.rs`) — `BTreeMap<InternalKey, Value>`.
+  `InternalKey` sorts `(user_key ASC, seq DESC)`, which makes MVCC point
+  lookups a single forward range-scan.
+* **SSTable** (`src/sstable.rs`) — data block + sparse index + bloom filter
+  + footer, read back-to-front from EOF. A lookup is: bloom filter
+  (probably-absent → skip the file) → binary search the in-memory sparse
+  index → one seek + sequential scan of one block.
+* **Compaction** (`src/compaction.rs`) — k-way merge over sstable iterators
+  using a min-heap keyed by `InternalKey`'s own `Ord`, so old-version and
+  tombstone GC falls out as a single `if` rather than a second pass.
+* **LsmEngine** (`src/lsm.rs`) — wires the above into `put` / `delete` /
+  `get_at(key, snapshot_seq)`.
+* **VectorIndex** (`src/vector.rs`) — flat brute-force search, struct-of-
+  arrays layout, 8-wide manual accumulator in the distance kernels so LLVM
+  can autovectorize on stable Rust, bounded min-heap for O(n log k) top-k.
+* **InvertedIndex** (`src/text.rs`) — postings lists + Okapi BM25.
+* **fusion** (`src/fusion.rs`) — Reciprocal Rank Fusion across the two
+  ranked lists, since cosine similarity and BM25 scores aren't on
+  comparable scales.
+
+See `docs/ARCHITECTURE.md` for the full design writeup, including what's
+deliberately out of scope (no ANN index, no leveled compaction, no
+replication, no concurrency) and why. See `docs/PERF.md` for profiling
+this repo on Linux with `perf`, `bpftrace`, `strace`, and `valgrind`.
 
 ## Layout
 
@@ -76,7 +103,28 @@ tests/           end-to-end integration tests
 docs/            architecture + profiling notes
 ```
 
-Zero external dependencies on purpose: every layer other people usually
-pull in (checksums, bloom filters, a bench harness) is small enough to
-write and read directly, and that's more useful here than the productivity
-win of `crc32fast` + `criterion` would be.
+## Non-goals
+
+This is scoped as a readable systems-primitives project, not a production
+database:
+
+* **No ANN index** — vector search is exact brute-force, O(n·dim) per query.
+* **No leveled compaction** — one tier, fully re-merged on every compaction.
+* **No replication or distributed anything** — single-node only.
+* **No block compression**, no two-level sstable index.
+* **No real tokenizer** — lowercase + split-on-non-alphanumeric, no
+  stemming, no stopwords, no phrase queries.
+* **No concurrency** — every structure is `&mut self`, single-threaded by
+  design.
+
+Each of these is expanded on in `docs/ARCHITECTURE.md` along with what
+building the real version would involve.
+
+## Dependencies
+
+Zero. Checksums, bloom filters, and the bench harness are all small enough
+to write and read directly rather than pull in `crc32fast` + `criterion`.
+
+## License
+
+MIT — see `LICENSE`.
