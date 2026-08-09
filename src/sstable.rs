@@ -46,7 +46,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 impl BloomFilter {
     fn with_capacity(expected_entries: usize) -> Self {
         let num_bits = (expected_entries.max(1) * BITS_PER_KEY).max(64) as u64;
-        let num_bytes = (num_bits as usize + 7) / 8;
+        let num_bytes = (num_bits as usize).div_ceil(8);
         let num_hashes = ((BITS_PER_KEY as f64) * std::f64::consts::LN_2)
             .round()
             .clamp(1.0, 30.0) as u32;

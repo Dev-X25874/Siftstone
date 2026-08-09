@@ -67,7 +67,7 @@ impl LsmEngine {
                     }
                 }
             }
-            found.sort_by(|a, b| b.0.cmp(&a.0));
+            found.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
             for (_, path) in found {
                 tiers.push(SSTableMeta {
                     path,
@@ -151,7 +151,7 @@ impl LsmEngine {
         let path = self.dir.join(format!("L{}.sst", id));
 
         let expected = (self.memtable.approx_bytes() / 48).max(1);
-        let mut writer = SSTableWriter::create(&path, expected)?;
+        let mut writer = SSTableWriter::create(path, expected)?;
         for (ik, v) in self.memtable.iter() {
             writer.add(ik, v)?;
         }
@@ -174,7 +174,7 @@ impl LsmEngine {
         let path = self.dir.join(format!("L{}.sst", id));
         // Single-tier design (see module docs): every compaction sees the
         // whole dataset, so it's always safe to fully GC tombstones here.
-        let merged = compaction::compact(&inputs, &path, true)?;
+        let merged = compaction::compact(&inputs, path, true)?;
         for input in &inputs {
             fs::remove_file(&input.path).ok();
         }
