@@ -1,0 +1,26 @@
+[package]
+name = "tpuffy"
+version = "0.1.0"
+edition = "2021"
+autobenches = false
+description = "A tiny LSM-backed hybrid (vector + full-text) search engine, built to demonstrate the systems primitives turbopuffer cares about."
+license = "MIT"
+
+[lib]
+name = "tpuffy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tpuffy"
+path = "src/main.rs"
+
+[[bin]]
+name = "tpuffy-bench"
+path = "benches/bench.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
