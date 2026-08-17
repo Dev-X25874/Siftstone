@@ -1,4 +1,4 @@
-# Siftstone
+# sift-core
 
 > Dependency-free hybrid search in Rust — LSM storage, BM25 full-text, flat vector index, and RRF fusion, all from scratch.
 
