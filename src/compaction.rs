@@ -30,11 +30,22 @@ pub fn should_compact(file_count: usize) -> bool {
 /// nothing further down to resurrect. When false (mid-tier compaction),
 /// tombstones are preserved so an older version sitting in a
 /// not-yet-compacted lower tier stays shadowed.
+///
+/// Bug 2 fix: the merged output is written to a `.tmp` file first, then
+/// renamed into place atomically only after SSTableWriter::finish() has
+/// fsynced it to disk. Input files are deleted only after the rename
+/// succeeds. Previously, inputs were deleted before the merged file was
+/// durable, which could cause data loss on a crash. A failed compaction
+/// now leaves the original inputs intact and a stale `.tmp` file (safe to
+/// delete on next open) instead of destroying data.
 pub fn compact(
     inputs: &[SSTableMeta],
     output_path: impl AsRef<Path>,
     is_last_level: bool,
 ) -> io::Result<SSTableMeta> {
+    let output_path = output_path.as_ref();
+    let tmp_path = output_path.with_extension("sst.tmp");
+
     let mut iters: Vec<SSTableIter> = inputs
         .iter()
         .map(|m| SSTableIter::open(&m.path))
@@ -52,7 +63,7 @@ pub fn compact(
     }
 
     let expected_entries: u64 = inputs.iter().map(|m| m.entry_count).sum();
-    let mut writer = SSTableWriter::create(output_path.as_ref(), expected_entries as usize)?;
+    let mut writer = SSTableWriter::create(&tmp_path, expected_entries as usize)?;
     let mut last_emitted_key: Option<Vec<u8>> = None;
 
     while let Some(Reverse((ik, idx))) = heap.pop() {
@@ -79,7 +90,16 @@ pub fn compact(
         writer.add(&ik, &value)?;
     }
 
-    writer.finish()
+    // finish() fsyncs the tmp file to durable storage before returning.
+    let mut meta = writer.finish()?;
+
+    // Atomic rename: the merged file becomes visible at its final path
+    // only after it is fully written and durable. If the rename fails
+    // we leave the .tmp file behind (harmless; no inputs have been touched).
+    std::fs::rename(&tmp_path, output_path)?;
+    meta.path = output_path.to_path_buf();
+
+    Ok(meta)
 }
 
 /// Convenience used by the engine to decide whether a given `key` is truly
