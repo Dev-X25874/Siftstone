@@ -145,8 +145,9 @@ impl Engine {
     }
 
     /// Upsert: writing an existing `id` again replaces its vector, its
-    /// text, and its blob. All three are stored together as one LSM value
-    /// so a single WAL-durable write covers the whole document.
+    /// text, and its blob. The LSM write happens first so that if it fails,
+    /// the in-memory indexes are never updated (no partial state). On a
+    /// non-crash IO failure the engine remains consistent.
     pub fn upsert(
         &mut self,
         id: u64,
@@ -154,17 +155,24 @@ impl Engine {
         text: &str,
         blob: &[u8],
     ) -> Result<(), EngineError> {
-        self.vectors.insert(id, vector)?;
-        self.text.index_document(id, text);
+        // Bug 5 fix (upsert): durable write first; in-memory indexes only
+        // updated on success so a transient IO error leaves state consistent.
         let record = encode_record(vector, text, blob);
         self.docs.put(&id.to_be_bytes(), &record)?;
+        self.vectors.insert(id, vector)?;
+        self.text.index_document(id, text);
         Ok(())
     }
 
+    /// Bug 5 fix (delete): LSM tombstone is written before the in-memory
+    /// indexes are cleared. Previously, if self.docs.delete() returned an
+    /// IO error after the memory indexes were already cleared, the document
+    /// would be invisible in memory but resurrected on the next restart
+    /// (since the LSM still held the live record).
     pub fn delete(&mut self, id: u64) -> Result<(), EngineError> {
+        self.docs.delete(&id.to_be_bytes())?;
         self.vectors.remove(id);
         self.text.remove_document(id);
-        self.docs.delete(&id.to_be_bytes())?;
         Ok(())
     }
 
