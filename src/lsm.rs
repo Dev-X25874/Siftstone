@@ -11,7 +11,7 @@
 
 use crate::compaction;
 use crate::memtable::MemTable;
-use crate::sstable::{SSTableIter, SSTableMeta, SSTableWriter};
+use crate::sstable::{SSTable, SSTableIter, SSTableMeta, SSTableWriter};
 use crate::wal::{self, Wal};
 use crate::{Seq, Value};
 use std::collections::HashMap;
@@ -50,6 +50,16 @@ impl LsmEngine {
 
         // Discover already-flushed sstables from a prior run: "L{id}.sst",
         // newest (highest id) first.
+        //
+        // Bug 6 fix: previously SSTableMeta was reconstructed with zeroed
+        // min_key, max_key, and entry_count. entry_count = 0 caused
+        // post-recovery compaction to create severely undersized bloom
+        // filters (BloomFilter::with_capacity(0)). We now open each SSTable
+        // file to read the footer and reconstruct the correct metadata,
+        // including the entry_count that was written by SSTableWriter::finish.
+        //
+        // Stale .sst.tmp files from a previously aborted compaction are
+        // cleaned up here so they don't interfere with future opens.
         let mut tiers = Vec::new();
         let mut max_sst_id = 0u64;
         if let Ok(read_dir) = fs::read_dir(&dir) {
@@ -57,6 +67,11 @@ impl LsmEngine {
             for entry in read_dir.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Clean up leftover tmp files from aborted compactions.
+                    if name.ends_with(".sst.tmp") {
+                        fs::remove_file(&path).ok();
+                        continue;
+                    }
                     if let Some(id_str) =
                         name.strip_prefix('L').and_then(|s| s.strip_suffix(".sst"))
                     {
@@ -69,12 +84,10 @@ impl LsmEngine {
             }
             found.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
             for (_, path) in found {
-                tiers.push(SSTableMeta {
-                    path,
-                    min_key: Vec::new(),
-                    max_key: Vec::new(),
-                    entry_count: 0,
-                });
+                // SSTable::open reads the footer (which now includes
+                // entry_count) and the sparse index (which gives min_key).
+                let meta = SSTable::open(&path)?.into_meta();
+                tiers.push(meta);
             }
         }
 
@@ -151,10 +164,12 @@ impl LsmEngine {
         let path = self.dir.join(format!("L{}.sst", id));
 
         let expected = (self.memtable.approx_bytes() / 48).max(1);
-        let mut writer = SSTableWriter::create(path, expected)?;
+        let mut writer = SSTableWriter::create(&path, expected)?;
         for (ik, v) in self.memtable.iter() {
             writer.add(ik, v)?;
         }
+        // Bug 1 fix: finish() now calls sync_data() before returning, so the
+        // SSTable is durable on disk before we truncate the WAL below.
         let meta = writer.finish()?;
         self.tiers.insert(0, meta);
 
@@ -174,7 +189,11 @@ impl LsmEngine {
         let path = self.dir.join(format!("L{}.sst", id));
         // Single-tier design (see module docs): every compaction sees the
         // whole dataset, so it's always safe to fully GC tombstones here.
-        let merged = compaction::compact(&inputs, path, true)?;
+        //
+        // Bug 2 fix: compact() now writes to a .tmp file and renames
+        // atomically only after the merged output is fsynced. Input files
+        // are removed inside compact() only after a successful rename.
+        let merged = compaction::compact(&inputs, &path, true)?;
         for input in &inputs {
             fs::remove_file(&input.path).ok();
         }
@@ -190,11 +209,9 @@ impl LsmEngine {
     /// pairs. Used by callers that keep derived in-memory state (an index
     /// built on top of this store) and need to rebuild it after a restart.
     ///
-    /// Unlike `compaction::compact`'s sorted k-way merge, this resolves
-    /// "newest version wins" with a plain hashmap keyed by `(seq, value)`
-    /// rather than relying on merge order — simpler, and fine at the scale
-    /// this engine targets. A `scan()` returning sorted output would reuse
-    /// exactly the heap-merge pattern in `compaction.rs`.
+    /// Resolves "newest version wins" with a plain hashmap keyed by
+    /// user_key — simpler than a heap merge and fine at the scale this
+    /// engine targets.
     pub fn iter_all(&self) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut latest: HashMap<Vec<u8>, (Seq, Value)> = HashMap::new();
 
@@ -268,7 +285,7 @@ mod tests {
             )
             .unwrap();
             if i % 20 == 0 {
-                db.flush().unwrap(); // force several sstables -> triggers compaction
+                db.flush().unwrap();
             }
         }
         for i in 0..200u32 {
@@ -302,4 +319,21 @@ mod tests {
         assert_eq!(db.get_at(b"k", seq2).unwrap(), Some(b"v2".to_vec()));
         fs::remove_dir_all(&dir).ok();
     }
-}
+
+    #[test]
+    fn recovery_restores_correct_entry_count() {
+        let dir = tmp_dir("entry_count_recovery");
+        {
+            let mut db = LsmEngine::open(&dir).unwrap();
+            for i in 0..50u32 {
+                db.put(format!("k{}", i).as_bytes(), b"v").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        // Reopen: entry_count must survive the restart.
+        let db2 = LsmEngine::open(&dir).unwrap();
+        assert!(db2.tiers.iter().all(|m| m.entry_count > 0));
+        fs::remove_dir_all(&dir).ok();
+    }
+            }
+        //! T
