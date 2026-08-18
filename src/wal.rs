@@ -91,7 +91,7 @@ impl Wal {
 }
 
 /// Replays every well-formed record in a WAL file, in write order, stopping
-/// silently at the first short read / bad checksum.
+/// silently at the first short read / bad checksum / unknown op byte.
 pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
     let path = path.as_ref();
     if !path.exists() {
@@ -146,13 +146,16 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
             break; // torn/corrupt tail record -> stop, don't trust anything after it either
         }
 
+        // Bug 7 fix: treat unknown op bytes as corruption and stop replay
+        // rather than silently interpreting them as Delete.
         let op = match op_buf[0] {
             0 => Op::Put,
-            _ => Op::Delete,
+            1 => Op::Delete,
+            _ => break, // corrupt op byte -> stop
         };
         let seq = u64::from_le_bytes(seq_buf);
         out.push(WalRecord { seq, op, key, val });
     }
 
     Ok(out)
-}
+        }
