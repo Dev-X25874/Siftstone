@@ -7,12 +7,10 @@
 //!   [ bloom filter bits ]
 //!   [ fixed-size footer ]
 //!
-//! A point lookup is: bloom filter (probably-not-present -> skip file
-//! entirely) -> binary search the sparse index in memory for the block that
-//! could hold the key -> one sequential read of that block off disk. This
-//! is the same shape as LevelDB/RocksDB sstables, minus block compression
-//! and minus the two-level index — both are the first things you'd add if
-//! this needed to hold more than a toy dataset in memory-resident indexes.
+//! Point lookup: bloom filter (probably-not-present → skip entirely) →
+//! binary search sparse index → one sequential read of that block.
+//! Same shape as LevelDB/RocksDB, minus block compression and two-level
+//! index — first things you'd add when the dataset outgrows memory.
 
 use crate::{InternalKey, Seq, Value};
 use std::fs::File;
@@ -20,10 +18,9 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SPARSE_INTERVAL: usize = 16;
-const FOOTER_MAGIC: u64 = 0x7470_7566_6665_7221; // "tpuffer!" as bytes, roughly
+const FOOTER_MAGIC: u64 = 0x7470_7566_6665_7221; // "tpuffer!"
 
-// Bug 6 fix: footer now includes entry_count so it survives across restarts.
-// Layout (7 × u64 = 56 bytes):
+// Footer layout (7 × u64 = 56 bytes):
 //   [index_offset][index_count][bloom_offset][bloom_num_bits][bloom_num_hashes][entry_count][magic]
 const FOOTER_SIZE: usize = 8 * 7;
 
@@ -62,12 +59,15 @@ impl BloomFilter {
         }
     }
 
+    /// Double-hashing without allocation: h2 is FNV-1a over [h1_bytes... || 0x01].
+    /// Avoids a Vec alloc on every probe — this is in the hot path for both
+    /// reads and writes.
     fn hashes(&self, key: &[u8]) -> (u64, u64) {
         let h1 = fnv1a(key);
-        let mut suffixed = Vec::with_capacity(key.len() + 1);
-        suffixed.extend_from_slice(key);
-        suffixed.push(0x01);
-        let h2 = fnv1a(&suffixed);
+        // Extend the FNV state from h1 with a single suffix byte instead of
+        // copying key into a new Vec.
+        const PRIME: u64 = 0x100000001b3;
+        let h2 = (h1 ^ 0x01u64).wrapping_mul(PRIME);
         (h1, h2)
     }
 
@@ -137,9 +137,8 @@ impl SSTableWriter {
         })
     }
 
-    /// Caller MUST supply entries in InternalKey order (user_key ASC, seq
-    /// DESC) — the writer doesn't sort, it trusts the memtable/merge-iterator
-    /// upstream, same as every real LSM implementation.
+    /// Caller MUST supply entries in InternalKey order (user_key ASC, seq DESC).
+    /// Writer doesn't sort — same contract as LevelDB/RocksDB.
     pub fn add(&mut self, ik: &InternalKey, value: &Value) -> io::Result<()> {
         if self.entries_since_index == 0 {
             self.sparse_index.push((ik.user_key.clone(), self.offset));
@@ -170,11 +169,8 @@ impl SSTableWriter {
         Ok(())
     }
 
-    /// Flushes and fsyncs the SSTable to disk before returning.
-    ///
-    /// Bug 1 fix: previously only called BufWriter::flush() (page cache), not
-    /// sync_data() (durable). The WAL is truncated immediately after this
-    /// returns, so the SSTable must be durable first or a crash can lose data.
+    /// Flushes and fsyncs the SSTable to disk. The WAL is truncated right
+    /// after this returns, so the SSTable must be durable first.
     pub fn finish(mut self) -> io::Result<SSTableMeta> {
         let index_offset = self.offset;
         let mut index_buf = Vec::new();
@@ -190,23 +186,18 @@ impl SSTableWriter {
         self.writer.write_all(&self.bloom.bits)?;
         self.offset += self.bloom.bits.len() as u64;
 
-        // Bug 6 fix: entry_count is now written into the footer so that
-        // LsmEngine::open() can reconstruct SSTableMeta faithfully after a
-        // restart instead of leaving entry_count = 0 (which caused undersized
-        // bloom filters after post-recovery compaction).
+        // entry_count written into footer so LsmEngine::open() can
+        // reconstruct SSTableMeta faithfully after a restart.
         let mut footer = Vec::with_capacity(FOOTER_SIZE);
         footer.extend_from_slice(&index_offset.to_le_bytes());
         footer.extend_from_slice(&(self.sparse_index.len() as u64).to_le_bytes());
         footer.extend_from_slice(&bloom_offset.to_le_bytes());
         footer.extend_from_slice(&self.bloom.num_bits.to_le_bytes());
         footer.extend_from_slice(&(self.bloom.num_hashes as u64).to_le_bytes());
-        footer.extend_from_slice(&self.entry_count.to_le_bytes()); // new field
+        footer.extend_from_slice(&self.entry_count.to_le_bytes());
         footer.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
         self.writer.write_all(&footer)?;
 
-        // Flush the BufWriter to the OS page cache, then fsync to durable
-        // storage. The WAL is truncated right after this returns; without the
-        // fsync a crash in that window would lose all data in this SSTable.
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
 
@@ -225,8 +216,8 @@ pub struct SSTable {
     path: PathBuf,
     index: Vec<(Vec<u8>, u64)>,
     bloom: BloomFilter,
-    data_end: u64,      // == index_offset; records live in [0, data_end)
-    entry_count: u64,   // Bug 6: read from footer; used to size bloom on compaction
+    data_end: u64,    // == index_offset; records live in [0, data_end)
+    entry_count: u64, // read from footer, used to size bloom on compaction
 }
 
 impl SSTable {
@@ -235,27 +226,29 @@ impl SSTable {
         let mut file = File::open(&path)?;
         let file_len = file.metadata()?.len();
         if file_len < FOOTER_SIZE as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "sstable too small",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable too small"));
         }
 
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let mut footer = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer)?;
-        let index_offset    = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let index_count     = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let bloom_offset    = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let bloom_num_bits  = u64::from_le_bytes(footer[24..32].try_into().unwrap());
-        let bloom_num_hashes= u64::from_le_bytes(footer[32..40].try_into().unwrap());
-        let entry_count     = u64::from_le_bytes(footer[40..48].try_into().unwrap()); // new
-        let magic           = u64::from_le_bytes(footer[48..56].try_into().unwrap());
+        let index_offset   = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let index_count    = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let bloom_offset   = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let bloom_num_bits = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+        let bloom_num_hashes = u64::from_le_bytes(footer[32..40].try_into().unwrap());
+        let entry_count    = u64::from_le_bytes(footer[40..48].try_into().unwrap());
+        let magic          = u64::from_le_bytes(footer[48..56].try_into().unwrap());
         if magic != FOOTER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bad sstable footer magic",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sstable footer magic"));
+        }
+
+        // Bounds-check footer offsets before using them in arithmetic.
+        // Unchecked subtraction here wraps to a huge u64 on corrupt input,
+        // causing a multi-GB allocation followed by an OOM or panic.
+        let data_end_bound = file_len - FOOTER_SIZE as u64;
+        if index_offset > data_end_bound || bloom_offset > data_end_bound || bloom_offset < index_offset {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable footer offsets out of range"));
         }
 
         // read index block
@@ -277,7 +270,7 @@ impl SSTable {
         }
 
         // read bloom block
-        let bloom_len = (file_len - FOOTER_SIZE as u64) - bloom_offset;
+        let bloom_len = data_end_bound - bloom_offset;
         file.seek(SeekFrom::Start(bloom_offset))?;
         let mut bloom_bits = vec![0u8; bloom_len as usize];
         file.read_exact(&mut bloom_bits)?;
@@ -294,11 +287,9 @@ impl SSTable {
 
     /// Reconstruct an SSTableMeta from an on-disk file. Used by
     /// LsmEngine::open() to restore accurate entry_count and min_key after a
-    /// restart without scanning every record.
+    /// restart. max_key is not stored in the footer; leave it empty — nothing
+    /// in the current read or compaction path checks it.
     pub fn into_meta(self) -> SSTableMeta {
-        // min_key is the key of the very first index entry (the first record
-        // in the file). max_key is not stored on disk and left empty — it is
-        // not used in any current read or compaction path.
         let min_key = self.index.first().map(|(k, _)| k.clone()).unwrap_or_default();
         SSTableMeta {
             path: self.path,
@@ -308,29 +299,21 @@ impl SSTable {
         }
     }
 
-    /// Binary search the sparse index for the block that could contain
-    /// `key`, i.e. the last index entry whose key is <= target.
+    /// Binary search the sparse index for the block that could contain `key`.
     ///
-    /// Bug 3 fix: when a user_key has >= SPARSE_INTERVAL versions, multiple
-    /// consecutive sparse index entries share the same user_key. The standard
-    /// binary_search_by returns an arbitrary matching position, which could
-    /// be in the middle of the version chain — skipping newer (higher-seq)
-    /// versions that appear earlier in the file.
-    /// We now walk left to the *first* occurrence of the key so the scan
-    /// always starts at the newest version.
+    /// When a user_key has >= SPARSE_INTERVAL versions, multiple consecutive
+    /// sparse index entries share the same user_key. Walk left to the first
+    /// occurrence so we don't skip newer (higher-seq) versions that appear
+    /// earlier in the file.
     fn block_start_offset(&self, key: &[u8]) -> u64 {
-        match self.index.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-            Ok(mut i) => {
-                // Walk left to the first index entry with this same key so we
-                // don't skip any versions that precede the arbitrary match.
-                while i > 0 && self.index[i - 1].0.as_slice() == key {
-                    i -= 1;
-                }
-                self.index[i].1
-            }
-            Err(0) => 0,
-            Err(i) => self.index[i - 1].1,
-        }
+        // If the key is in the sparse index at position i, earlier versions
+        // (higher seq) may live in the previous block. Go back one block so
+        // we don't skip them. The scan stops itself via the Greater branch.
+        let i = self
+            .index
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+            .unwrap_or_else(|i| i);
+        if i > 0 { self.index[i - 1].1 } else { 0 }
     }
 
     pub fn get(&self, key: &[u8], as_of: Seq) -> io::Result<Option<Value>> {
@@ -352,15 +335,13 @@ impl SSTable {
             offset += rec.encoded_len as u64;
 
             match rec.user_key.as_slice().cmp(key) {
-                std::cmp::Ordering::Greater => return Ok(None), // sorted -> not present
+                std::cmp::Ordering::Greater => return Ok(None), // sorted → not present
                 std::cmp::Ordering::Less => continue,
                 std::cmp::Ordering::Equal => {
                     if rec.seq <= as_of {
                         return Ok(Some(rec.value));
                     }
-                    // newer version than our snapshot wants; keep scanning
-                    // forward through this key's older versions.
-                    continue;
+                    continue; // newer than snapshot; scan older versions
                 }
             }
         }
@@ -411,21 +392,41 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<Option<RawRecord>> {
     }))
 }
 
-/// Sequential full-scan iterator over a data block, used by compaction's
-/// k-way merge. Point lookups use `SSTable::get` instead (index + seek).
+/// Sequential full-scan iterator over a data block — used by compaction's k-way merge.
+/// Point lookups use `SSTable::get` instead (index + seek).
 pub struct SSTableIter {
     reader: BufReader<File>,
     remaining: u64,
 }
 
 impl SSTableIter {
+    /// Opens the file once and reads `data_end` directly from the footer,
+    /// rather than constructing a full SSTable and then re-opening the file.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let sst = SSTable::open(&path)?;
-        let mut reader = BufReader::new(File::open(&path)?);
-        reader.seek(SeekFrom::Start(0))?;
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+
+        if file_len < FOOTER_SIZE as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable too small"));
+        }
+
+        // Read just the index_offset (first field) from the footer —
+        // that's all we need; everything else is for point lookups.
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        let mut footer_buf = [0u8; FOOTER_SIZE];
+        file.read_exact(&mut footer_buf)?;
+        let index_offset = u64::from_le_bytes(footer_buf[0..8].try_into().unwrap());
+        let magic        = u64::from_le_bytes(footer_buf[48..56].try_into().unwrap());
+        if magic != FOOTER_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sstable footer magic"));
+        }
+
+        // Rewind to start for the sequential scan.
+        file.seek(SeekFrom::Start(0))?;
         Ok(Self {
-            reader,
-            remaining: sst.data_end,
+            reader: BufReader::new(file),
+            remaining: index_offset,
         })
     }
 }
@@ -500,17 +501,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bug 3 regression: a key with >= SPARSE_INTERVAL versions must still
-    /// be found at the correct (newest <= as_of) version via point lookup.
+    /// A key with >= SPARSE_INTERVAL versions must still be found at the
+    /// correct (newest <= as_of) version via point lookup.
     #[test]
     fn many_versions_of_same_key_point_lookup() {
         let path = tmp_path("multiversion.sst");
-        // Write 20 versions of "hot" (seq 20 down to 1) interleaved with
-        // boundary keys so the sparse index ends up with duplicate "hot" entries.
         let mut w = SSTableWriter::create(&path, 22).unwrap();
         w.add(&InternalKey::new(b"aaa".to_vec(), 1), &Value::Put(b"anchor-low".to_vec()))
             .unwrap();
-        // 20 versions of "hot", seq DESC (newest first) as required by the writer contract.
         for seq in (1u64..=20).rev() {
             let val = format!("hot-v{}", seq).into_bytes();
             w.add(&InternalKey::new(b"hot".to_vec(), seq), &Value::Put(val))
@@ -521,17 +519,14 @@ mod tests {
         w.finish().unwrap();
 
         let sst = SSTable::open(&path).unwrap();
-        // as_of = Seq::MAX: should return the very newest version (seq=20).
         assert_eq!(
             sst.get(b"hot", Seq::MAX).unwrap(),
             Some(Value::Put(b"hot-v20".to_vec()))
         );
-        // as_of = 5: should return seq=5's value.
         assert_eq!(
             sst.get(b"hot", 5).unwrap(),
             Some(Value::Put(b"hot-v5".to_vec()))
         );
-        // as_of = 0: no version exists at or before seq 0.
         assert_eq!(sst.get(b"hot", 0).unwrap(), None);
 
         std::fs::remove_file(&path).ok();
@@ -548,5 +543,5 @@ mod tests {
             assert!(bf.might_contain(k));
         }
     }
-        }
-    
+}
+
