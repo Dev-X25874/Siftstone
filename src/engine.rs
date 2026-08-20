@@ -155,8 +155,8 @@ impl Engine {
         text: &str,
         blob: &[u8],
     ) -> Result<(), EngineError> {
-        // Bug 5 fix (upsert): durable write first; in-memory indexes only
-        // updated on success so a transient IO error leaves state consistent.
+        // Durable write first — in-memory indexes only updated on success so
+        // a transient IO error doesn't leave state inconsistent.
         let record = encode_record(vector, text, blob);
         self.docs.put(&id.to_be_bytes(), &record)?;
         self.vectors.insert(id, vector)?;
@@ -164,11 +164,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Bug 5 fix (delete): LSM tombstone is written before the in-memory
-    /// indexes are cleared. Previously, if self.docs.delete() returned an
-    /// IO error after the memory indexes were already cleared, the document
-    /// would be invisible in memory but resurrected on the next restart
-    /// (since the LSM still held the live record).
+    /// LSM tombstone written before clearing in-memory indexes. If the LSM
+    /// write fails, memory stays consistent and the doc isn't silently lost.
     pub fn delete(&mut self, id: u64) -> Result<(), EngineError> {
         self.docs.delete(&id.to_be_bytes())?;
         self.vectors.remove(id);
