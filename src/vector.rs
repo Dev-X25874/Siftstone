@@ -187,10 +187,8 @@ impl PartialOrd for Scored {
     }
 }
 impl Ord for Scored {
-    // Bug 4 fix: NaN scores are treated as -inf (worst) so they never enter
-    // or stay in the bounded top-k heap, matching the documented contract.
-    // Previously unwrap_or(Ordering::Equal) made NaN compare equal to every
-    // score, letting it displace a legitimately high-scoring result.
+    // NaN → Less so it never wins in the bounded heap (unwrap_or(Equal)
+    // would let NaN displace a real high-scoring result).
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .partial_cmp(&other.score)
@@ -299,9 +297,9 @@ mod tests {
 
     #[test]
     fn nan_score_does_not_displace_real_results() {
-        // A NaN-producing input (zero vector with Dot metric) should never
-        // outrank a real scored result. Previously Ordering::Equal let NaN
-        // winners stay in the heap.
+        // zero-vector query on Cosine -> NaN score; must not displace a real hit
+        
+        
         let mut idx = VectorIndex::new(2);
         idx.insert(1, &[1.0, 0.0]).unwrap();
         idx.insert(2, &[0.0, 0.0]).unwrap(); // zero vector -> NaN on Cosine
@@ -309,5 +307,4 @@ mod tests {
         // id=1 must be ranked first regardless of NaN from id=2
         assert_eq!(results[0].0, 1);
     }
-                }
-                   
+}
