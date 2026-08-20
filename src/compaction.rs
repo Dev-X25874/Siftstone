@@ -31,13 +31,10 @@ pub fn should_compact(file_count: usize) -> bool {
 /// tombstones are preserved so an older version sitting in a
 /// not-yet-compacted lower tier stays shadowed.
 ///
-/// Bug 2 fix: the merged output is written to a `.tmp` file first, then
-/// renamed into place atomically only after SSTableWriter::finish() has
-/// fsynced it to disk. Input files are deleted only after the rename
-/// succeeds. Previously, inputs were deleted before the merged file was
-/// durable, which could cause data loss on a crash. A failed compaction
-/// now leaves the original inputs intact and a stale `.tmp` file (safe to
-/// delete on next open) instead of destroying data.
+/// Merged output goes to `.tmp` first, then atomically renamed into place
+/// after fsync. Inputs are only removed after a successful rename, so a
+/// crash leaves the original files intact and a stale `.tmp` that gets
+/// cleaned up on the next open().
 pub fn compact(
     inputs: &[SSTableMeta],
     output_path: impl AsRef<Path>,
