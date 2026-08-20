@@ -3,11 +3,9 @@
 //! compact once too many sstables pile up. Read path: memtable -> tiers
 //! newest-to-oldest, each guarded by its bloom filter.
 //!
-//! This is intentionally a *single* tier list rather than LevelDB-style
-//! leveling (L0..Ln with size ratios) — leveling is a write-amplification
-//! optimization that matters once you have gigabytes of data; at this scale
-//! it would add complexity without changing the reasoning about
-//! correctness, which is the point of this repo.
+//! Single tier list rather than LevelDB-style leveling (L0..Ln with size
+//! ratios) — leveling optimizes write amplification at gigabyte scale; at
+//! this scale it'd add complexity without changing correctness reasoning.
 
 use crate::compaction;
 use crate::memtable::MemTable;
@@ -48,18 +46,12 @@ impl LsmEngine {
         }
         let wal = Wal::open(&wal_path)?;
 
-        // Discover already-flushed sstables from a prior run: "L{id}.sst",
-        // newest (highest id) first.
+        // Discover already-flushed sstables: "L{id}.sst", newest (highest id) first.
+        // Open each file to read the footer and get the real entry_count —
+        // reconstructing with zeroed entry_count caused undersized bloom filters
+        // after post-recovery compaction.
         //
-        // Bug 6 fix: previously SSTableMeta was reconstructed with zeroed
-        // min_key, max_key, and entry_count. entry_count = 0 caused
-        // post-recovery compaction to create severely undersized bloom
-        // filters (BloomFilter::with_capacity(0)). We now open each SSTable
-        // file to read the footer and reconstruct the correct metadata,
-        // including the entry_count that was written by SSTableWriter::finish.
-        //
-        // Stale .sst.tmp files from a previously aborted compaction are
-        // cleaned up here so they don't interfere with future opens.
+        // Stale .sst.tmp files from an aborted flush or compaction are removed here.
         let mut tiers = Vec::new();
         let mut max_sst_id = 0u64;
         if let Ok(read_dir) = fs::read_dir(&dir) {
@@ -67,7 +59,6 @@ impl LsmEngine {
             for entry in read_dir.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Clean up leftover tmp files from aborted compactions.
                     if name.ends_with(".sst.tmp") {
                         fs::remove_file(&path).ok();
                         continue;
@@ -84,8 +75,6 @@ impl LsmEngine {
             }
             found.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
             for (_, path) in found {
-                // SSTable::open reads the footer (which now includes
-                // entry_count) and the sparse index (which gives min_key).
                 let meta = SSTable::open(&path)?.into_meta();
                 tiers.push(meta);
             }
@@ -152,27 +141,33 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Flushes the memtable to a new sstable unconditionally (a no-op if
-    /// the memtable is empty). Exposed so tests/CLI can control the
-    /// exact durability/compaction boundary instead of waiting on size.
+    /// Flushes the memtable to a new sstable unconditionally (no-op if empty).
+    /// Exposed so tests/CLI can control the durability/compaction boundary.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
         }
         let id = self.next_sst_id;
         self.next_sst_id += 1;
-        let path = self.dir.join(format!("L{}.sst", id));
+        let final_path = self.dir.join(format!("L{}.sst", id));
+        let tmp_path = self.dir.join(format!("L{}.sst.tmp", id));
 
+        // Write to .tmp first, then rename atomically — same pattern as
+        // compaction. A crash mid-write leaves a .sst.tmp that gets cleaned
+        // up on the next open(), rather than a corrupt .sst that blocks
+        // recovery (LsmEngine::open calls SSTable::open()?  on every .sst).
         let expected = (self.memtable.approx_bytes() / 48).max(1);
-        let mut writer = SSTableWriter::create(&path, expected)?;
+        let mut writer = SSTableWriter::create(&tmp_path, expected)?;
         for (ik, v) in self.memtable.iter() {
             writer.add(ik, v)?;
         }
-        // Bug 1 fix: finish() now calls sync_data() before returning, so the
-        // SSTable is durable on disk before we truncate the WAL below.
-        let meta = writer.finish()?;
-        self.tiers.insert(0, meta);
+        // finish() calls sync_data() before returning, so the SSTable is
+        // durable on disk before we truncate the WAL below.
+        let mut meta = writer.finish()?;
+        fs::rename(&tmp_path, &final_path)?;
+        meta.path = final_path;
 
+        self.tiers.insert(0, meta);
         self.memtable.clear();
         self.wal = Wal::reset(self.dir.join("wal.log"))?;
 
@@ -187,12 +182,8 @@ impl LsmEngine {
         let id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = self.dir.join(format!("L{}.sst", id));
-        // Single-tier design (see module docs): every compaction sees the
-        // whole dataset, so it's always safe to fully GC tombstones here.
-        //
-        // Bug 2 fix: compact() now writes to a .tmp file and renames
-        // atomically only after the merged output is fsynced. Input files
-        // are removed inside compact() only after a successful rename.
+        // Single-tier design: every compaction sees the whole dataset, so
+        // tombstones can always be fully GC'd here.
         let merged = compaction::compact(&inputs, &path, true)?;
         for input in &inputs {
             fs::remove_file(&input.path).ok();
@@ -205,13 +196,12 @@ impl LsmEngine {
         self.tiers.len()
     }
 
-    /// Full scan of the current snapshot's live (non-deleted) key/value
-    /// pairs. Used by callers that keep derived in-memory state (an index
-    /// built on top of this store) and need to rebuild it after a restart.
+    /// Full scan of the current snapshot's live (non-deleted) key/value pairs.
+    /// Used by callers that keep derived in-memory state and need to rebuild
+    /// it after a restart.
     ///
-    /// Resolves "newest version wins" with a plain hashmap keyed by
-    /// user_key — simpler than a heap merge and fine at the scale this
-    /// engine targets.
+    /// "Newest version wins" via a hashmap keyed by user_key — simpler than
+    /// a heap merge and fine at the scale this engine targets.
     pub fn iter_all(&self) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut latest: HashMap<Vec<u8>, (Seq, Value)> = HashMap::new();
 
@@ -330,10 +320,8 @@ mod tests {
             }
             db.flush().unwrap();
         }
-        // Reopen: entry_count must survive the restart.
         let db2 = LsmEngine::open(&dir).unwrap();
         assert!(db2.tiers.iter().all(|m| m.entry_count > 0));
         fs::remove_dir_all(&dir).ok();
     }
-            }
-        //! T
+}
