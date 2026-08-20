@@ -1,8 +1,7 @@
 //! Inverted index with BM25 ranking. No stemming, no stopword list, no
-//! phrase queries — this is the minimum viable full-text layer, sized to
-//! demonstrate postings-list structure and BM25 math rather than to
-//! compete with a real tokenizer/analyzer pipeline (documented as future
-//! work in docs/ARCHITECTURE.md).
+//! phrase queries — minimum viable full-text layer to demonstrate
+//! postings-list structure and BM25 math. Tokenizer/analyzer pipeline
+//! improvements are future work (see docs/ARCHITECTURE.md).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -33,7 +32,7 @@ impl InvertedIndex {
         }
     }
 
-    /// Upsert semantics: re-indexing a `doc_id` replaces its prior terms.
+    /// Upsert: re-indexing a `doc_id` replaces its prior terms.
     pub fn index_document(&mut self, doc_id: u64, text: &str) {
         self.remove_document(doc_id);
 
@@ -61,6 +60,9 @@ impl InvertedIndex {
             for postings in self.postings.values_mut() {
                 postings.retain(|p| p.doc_id != doc_id);
             }
+            // Drop empty posting list entries — otherwise high-churn workloads
+            // accumulate empty Vecs in the HashMap indefinitely.
+            self.postings.retain(|_, v| !v.is_empty());
         }
     }
 
@@ -85,7 +87,7 @@ impl InvertedIndex {
 
         for term in tokenize(query) {
             if !seen_terms.insert(term.clone()) {
-                continue; // duplicate query term contributes once, per doc-freq IDF
+                continue; // duplicate query term counts once per doc-freq IDF
             }
             let Some(postings) = self.postings.get(&term) else {
                 continue;
@@ -153,5 +155,14 @@ mod tests {
         idx.index_document(1, "bananas only");
         assert!(idx.search("apples", 5).is_empty());
         assert_eq!(idx.search("bananas", 5)[0].0, 1);
+    }
+
+    #[test]
+    fn remove_document_prunes_empty_posting_lists() {
+        let mut idx = InvertedIndex::new();
+        idx.index_document(1, "unique term alpha");
+        idx.remove_document(1);
+        // posting list for "unique", "term", "alpha" should be gone entirely
+        assert!(idx.postings.is_empty());
     }
 }
