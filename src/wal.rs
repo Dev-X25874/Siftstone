@@ -5,10 +5,8 @@
 //!
 //!   [checksum: u64][seq: u64][op: u8][key_len: u32][key][val_len: u32][val]
 //!
-//! `checksum` covers everything after it. On replay we stop at the first
-//! record that fails its checksum or runs past EOF instead of erroring out —
-//! that's the normal shape of a torn write after a crash, and losing only
-//! the unflushed tail is the point of a WAL.
+//! On replay we stop at the first record that fails its checksum or runs
+//! past EOF — that's the normal shape of a torn write after a crash.
 
 use crate::Seq;
 use std::fs::{File, OpenOptions};
@@ -28,8 +26,7 @@ pub struct WalRecord {
     pub val: Vec<u8>,
 }
 
-/// FNV-1a 64-bit. Not cryptographic, just fast corruption detection — the
-/// same tradeoff LevelDB/RocksDB make with CRC32C.
+/// FNV-1a 64-bit — fast corruption detection, same tradeoff as LevelDB's CRC32C.
 fn fnv1a(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -69,15 +66,13 @@ impl Wal {
         Ok(())
     }
 
-    /// Durability boundary: callers decide the fsync policy (every write vs.
-    /// batched) — that's a latency/durability knob we expose rather than bake in.
+    /// Callers decide fsync frequency — that's a latency/durability knob we expose.
     pub fn sync(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_data()
     }
 
-    /// Truncates the WAL to zero length. Called after a memtable flush makes
-    /// the log's contents redundant with the new sstable on disk.
+    /// Truncates the WAL to zero. Called after memtable flush makes the log redundant.
     pub fn reset(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -90,8 +85,8 @@ impl Wal {
     }
 }
 
-/// Replays every well-formed record in a WAL file, in write order, stopping
-/// silently at the first short read / bad checksum / unknown op byte.
+/// Replays every well-formed record, stopping silently at the first
+/// short read / bad checksum / unknown op byte.
 pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
     let path = path.as_ref();
     if !path.exists() {
@@ -103,7 +98,7 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
     loop {
         let mut checksum_buf = [0u8; 8];
         if reader.read_exact(&mut checksum_buf).is_err() {
-            break; // clean EOF or torn checksum field -> stop
+            break; // clean EOF or torn checksum field
         }
         let expected_checksum = u64::from_le_bytes(checksum_buf);
 
@@ -143,19 +138,19 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
         body.extend_from_slice(&val);
 
         if fnv1a(&body) != expected_checksum {
-            break; // torn/corrupt tail record -> stop, don't trust anything after it either
+            break; // torn/corrupt tail record
         }
 
-        // Bug 7 fix: treat unknown op bytes as corruption and stop replay
-        // rather than silently interpreting them as Delete.
+        // Unknown op bytes are treated as corruption — stop, don't silently
+        // interpret them as Delete.
         let op = match op_buf[0] {
             0 => Op::Put,
             1 => Op::Delete,
-            _ => break, // corrupt op byte -> stop
+            _ => break,
         };
         let seq = u64::from_le_bytes(seq_buf);
         out.push(WalRecord { seq, op, key, val });
     }
 
     Ok(out)
-        }
+}
