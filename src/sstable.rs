@@ -226,29 +226,41 @@ impl SSTable {
         let mut file = File::open(&path)?;
         let file_len = file.metadata()?.len();
         if file_len < FOOTER_SIZE as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable too small",
+            ));
         }
 
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let mut footer = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer)?;
-        let index_offset   = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let index_count    = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let bloom_offset   = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let index_count = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let bloom_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
         let bloom_num_bits = u64::from_le_bytes(footer[24..32].try_into().unwrap());
         let bloom_num_hashes = u64::from_le_bytes(footer[32..40].try_into().unwrap());
-        let entry_count    = u64::from_le_bytes(footer[40..48].try_into().unwrap());
-        let magic          = u64::from_le_bytes(footer[48..56].try_into().unwrap());
+        let entry_count = u64::from_le_bytes(footer[40..48].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[48..56].try_into().unwrap());
         if magic != FOOTER_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sstable footer magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad sstable footer magic",
+            ));
         }
 
         // Bounds-check footer offsets before using them in arithmetic.
         // Unchecked subtraction here wraps to a huge u64 on corrupt input,
         // causing a multi-GB allocation followed by an OOM or panic.
         let data_end_bound = file_len - FOOTER_SIZE as u64;
-        if index_offset > data_end_bound || bloom_offset > data_end_bound || bloom_offset < index_offset {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable footer offsets out of range"));
+        if index_offset > data_end_bound
+            || bloom_offset > data_end_bound
+            || bloom_offset < index_offset
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable footer offsets out of range",
+            ));
         }
 
         // read index block
@@ -290,7 +302,11 @@ impl SSTable {
     /// restart. max_key is not stored in the footer; leave it empty — nothing
     /// in the current read or compaction path checks it.
     pub fn into_meta(self) -> SSTableMeta {
-        let min_key = self.index.first().map(|(k, _)| k.clone()).unwrap_or_default();
+        let min_key = self
+            .index
+            .first()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
         SSTableMeta {
             path: self.path,
             min_key,
@@ -313,7 +329,11 @@ impl SSTable {
             .index
             .binary_search_by(|(k, _)| k.as_slice().cmp(key))
             .unwrap_or_else(|i| i);
-        if i > 0 { self.index[i - 1].1 } else { 0 }
+        if i > 0 {
+            self.index[i - 1].1
+        } else {
+            0
+        }
     }
 
     pub fn get(&self, key: &[u8], as_of: Seq) -> io::Result<Option<Value>> {
@@ -408,7 +428,10 @@ impl SSTableIter {
         let file_len = file.metadata()?.len();
 
         if file_len < FOOTER_SIZE as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "sstable too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sstable too small",
+            ));
         }
 
         // Read just the index_offset (first field) from the footer —
@@ -417,9 +440,12 @@ impl SSTableIter {
         let mut footer_buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer_buf)?;
         let index_offset = u64::from_le_bytes(footer_buf[0..8].try_into().unwrap());
-        let magic        = u64::from_le_bytes(footer_buf[48..56].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer_buf[48..56].try_into().unwrap());
         if magic != FOOTER_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sstable footer magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad sstable footer magic",
+            ));
         }
 
         // Rewind to start for the sequential scan.
@@ -507,15 +533,21 @@ mod tests {
     fn many_versions_of_same_key_point_lookup() {
         let path = tmp_path("multiversion.sst");
         let mut w = SSTableWriter::create(&path, 22).unwrap();
-        w.add(&InternalKey::new(b"aaa".to_vec(), 1), &Value::Put(b"anchor-low".to_vec()))
-            .unwrap();
+        w.add(
+            &InternalKey::new(b"aaa".to_vec(), 1),
+            &Value::Put(b"anchor-low".to_vec()),
+        )
+        .unwrap();
         for seq in (1u64..=20).rev() {
             let val = format!("hot-v{}", seq).into_bytes();
             w.add(&InternalKey::new(b"hot".to_vec(), seq), &Value::Put(val))
                 .unwrap();
         }
-        w.add(&InternalKey::new(b"zzz".to_vec(), 1), &Value::Put(b"anchor-high".to_vec()))
-            .unwrap();
+        w.add(
+            &InternalKey::new(b"zzz".to_vec(), 1),
+            &Value::Put(b"anchor-high".to_vec()),
+        )
+        .unwrap();
         w.finish().unwrap();
 
         let sst = SSTable::open(&path).unwrap();
@@ -544,4 +576,3 @@ mod tests {
         }
     }
 }
-

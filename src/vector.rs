@@ -298,8 +298,7 @@ mod tests {
     #[test]
     fn nan_score_does_not_displace_real_results() {
         // zero-vector query on Cosine -> NaN score; must not displace a real hit
-        
-        
+
         let mut idx = VectorIndex::new(2);
         idx.insert(1, &[1.0, 0.0]).unwrap();
         idx.insert(2, &[0.0, 0.0]).unwrap(); // zero vector -> NaN on Cosine
