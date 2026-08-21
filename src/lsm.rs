@@ -178,7 +178,7 @@ impl LsmEngine {
         if !compaction::should_compact(self.tiers.len()) {
             return Ok(());
         }
-        let inputs: Vec<SSTableMeta> = self.tiers.drain(..).collect();
+        let inputs: Vec<SSTableMeta> = std::mem::take(&mut self.tiers);
         let id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = self.dir.join(format!("L{}.sst", id));
@@ -325,3 +325,4 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
